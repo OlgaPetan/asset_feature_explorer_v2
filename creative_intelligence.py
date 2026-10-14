@@ -10,7 +10,9 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 from scipy.stats import mannwhitneyu
 import warnings
+import os
 warnings.filterwarnings("ignore")
+from insight_assistant import render_assistant
 
 st.set_page_config(
     page_title="Asset Intelligence",
@@ -233,9 +235,17 @@ div[role="radiogroup"] label:has(input:checked) p{color:#fff;font-weight:600;}
 
 
 # ── data loading ──────────────────────────────────────────────────────────────
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+def data_path(name):
+    """Data files are read from the app's folder (fallback: the folder Streamlit was started from)."""
+    p = os.path.join(APP_DIR, name)
+    return p if os.path.exists(p) else os.path.abspath(name)
+DATA_FILES = ["precomputed_data.pkl", "insight_catalog.csv", "rulebook.csv", "uplift_all_scopes.csv"]
+
 @st.cache_data
-def load_all():
-    with open("precomputed_data.pkl", "rb") as f:
+def load_all(file_versions):
+    """file_versions (modification times) is only the cache key: adding or updating a file reloads it."""
+    with open(data_path("precomputed_data.pkl"), "rb") as f:
         payload = pickle.load(f)
     results = payload["results"]
     meta    = payload["meta"]
@@ -251,21 +261,22 @@ def load_all():
         df[[c for c in do   if c in df.columns]].mean(axis=1, skipna=False) * 0.6
     ).round(4)
 
-    # insight catalog + rulebook
-    try:
-        catalog  = pd.read_csv("insight_catalog.csv")
-        rulebook = pd.read_csv("rulebook.csv")
-        for d in [catalog, rulebook]:
-            for c in d.select_dtypes(include="object").columns:
-                d[c] = d[c].fillna("")
+    # insight catalog + rulebook (loaded independently: a missing rulebook doesn't disable the catalog)
+    def _csv(name):
+        try:
+            d = pd.read_csv(data_path(name))
+        except FileNotFoundError:
+            return None
+        for c in d.select_dtypes(include="object").columns:
+            d[c] = d[c].fillna("")
+        return d
+    catalog, rulebook = _csv("insight_catalog.csv"), _csv("rulebook.csv")
+    if catalog is not None:
         catalog["evidence_uplift_pp"] = pd.to_numeric(catalog["evidence_uplift_pp"], errors="coerce")
-        has_ins = True
-    except FileNotFoundError:
-        catalog = rulebook = None
-        has_ins = False
+    has_ins = catalog is not None
 
     try:
-        uplift_df = pd.read_csv("uplift_all_scopes.csv")
+        uplift_df = pd.read_csv(data_path("uplift_all_scopes.csv"))
         uplift_df["uplift_pp"] = pd.to_numeric(uplift_df["uplift_pp"], errors="coerce")
     except FileNotFoundError:
         uplift_df = None
@@ -295,7 +306,8 @@ def load_all():
     return df, results, meta, catalog, rulebook, uplift_df, has_ins, camp_map
 
 try:
-    df_full, results, meta, catalog, rulebook, uplift_df, has_ins, camp_map = load_all()
+    df_full, results, meta, catalog, rulebook, uplift_df, has_ins, camp_map = load_all(
+        tuple(os.path.getmtime(data_path(n)) if os.path.exists(data_path(n)) else 0 for n in DATA_FILES))
 except FileNotFoundError as e:
     st.error(f"Required file not found: {e}"); st.stop()
 
@@ -596,7 +608,7 @@ def stability(sub, mask, mc, min_side=5):
                      "Same direction": f"{same} of {len(segs)}", "Verdict": verdict})
     return pd.DataFrame(summ), pd.DataFrame(det)
 
-def render_stability(sub, mask, mc, what, key):
+def render_stability(sub, mask, mc, what, key, nested=False):
     summ, det = stability(sub, mask, mc)
     if summ.empty:
         st.markdown('<p style="color:#AAA;font-size:.8rem">Not enough assets for a stability check.</p>', unsafe_allow_html=True); return
@@ -606,9 +618,14 @@ def render_stability(sub, mask, mc, what, key):
                 unsafe_allow_html=True)
     st.dataframe(summ, hide_index=True, use_container_width=True)
     if not det.empty:
-        with st.expander("Segment detail"):
+        if nested:   # already inside an expander — Streamlit does not allow nesting another one
+            st.markdown('<div class="sec-label" style="margin-top:.6rem">Segment detail</div>', unsafe_allow_html=True)
             st.dataframe(det, hide_index=True, use_container_width=True)
             dl(det, f"stability_{what}", key)
+        else:
+            with st.expander("Segment detail"):
+                st.dataframe(det, hide_index=True, use_container_width=True)
+                dl(det, f"stability_{what}", key)
 
 
 # ── precomputed combo helpers ─────────────────────────────────────────────────
@@ -796,6 +813,21 @@ PAGES = [
 ]
 page = st.radio("Navigation", PAGES, horizontal=True, label_visibility="collapsed", key="nav")
 
+# ── Insight Assistant (floating; rendered before the page so it stays available on every page) ──
+def _assistant_scope():
+    ss = st.session_state
+    pairs = []
+    if len(ss.get("f_mkts") or []) == 1: pairs.append(("Market", ss["f_mkts"][0]))
+    if ss.get("f_brand", "All Brands") != "All Brands": pairs.append(("Brand", ss["f_brand"]))
+    if ss.get("f_ou", "All OUs") != "All OUs": pairs.append(("OU", ss["f_ou"]))
+    note = []
+    if len(pairs) > 1: note.append(f"catalog has single scopes — using {pairs[0][0]} {pairs[0][1]}")
+    if ss.get("f_year") or ss.get("f_camp", 0): note.append("year/campaign not in catalog")
+    return {"pair": pairs[0] if pairs else None, "note": "; ".join(note)}
+
+render_assistant(catalog, rulebook, _assistant_scope(),
+                 {M_LABEL[m] for m in LOWER_BETTER}, RULE_ACTION, FEAT_LABEL)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FILTER BAR — rendered per-page so hero appears above filters
 # ══════════════════════════════════════════════════════════════════════════════
@@ -965,7 +997,8 @@ if page == "ℹ · About this App":
       <div style="font-size:.8rem;color:#888;margin-top:.9rem;padding-top:.7rem;border-top:1px solid #F0EEE8;">
         Use the <strong>Filters</strong> at the top to scope results by OU, Brand, Year, Campaign, or Market, and
         <strong>Compare against</strong> to choose the benchmark behind every “vs average”. Every table has a
-        <strong>Download CSV</strong> button.
+        <strong>Download CSV</strong> button. Use <strong>✦ Ask insights</strong> (bottom-right) to question the Insight Catalog and Rulebook in plain
+        English — each answer has a chart and a CSV download.
         All analysis updates in real time. Start with <strong>01 · Overview &amp; Performance</strong>
         and work through the pages in order.
       </div>
@@ -2005,7 +2038,7 @@ elif page == "03 · Combination Explorer":
                           <div class="asset-meta">{ml} {sc} &nbsp;·&nbsp; {str(nm)[:45]}</div>
                         </div>""", unsafe_allow_html=True)
                     with st.expander("Stability check — does it hold across OUs, markets, formats?"):
-                        render_stability(sub_df, m_best, mc, "this combination", f"cx_st_{mc}")
+                        render_stability(sub_df, m_best, mc, "this combination", f"cx_st_{mc}", nested=True)
 
             # ── Feature Explorer ─────────────────────────────────────────────
             st.markdown("""<div class="explorer-card">
@@ -2272,7 +2305,7 @@ elif page == "04 · Feature Combinations & OU Impact":
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "05 · Insight Catalog":
     if not has_ins or catalog is None:
-        st.warning("insight_catalog.csv not found. Run the insight pipeline first."); st.stop()
+        st.warning(f"insight_catalog.csv not found in {APP_DIR}. Run the insight pipeline and put the file there."); st.stop()
 
     st.markdown(f"""
     <div class="hero">
@@ -2551,8 +2584,8 @@ elif page == "05 · Insight Catalog":
 # PAGE 06 — RULEBOOK
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "06 · Rulebook":
-    if not has_ins or rulebook is None:
-        st.warning("rulebook.csv not found. Run the insight pipeline first."); st.stop()
+    if rulebook is None:
+        st.warning(f"rulebook.csv not found in {APP_DIR}. Run the insight pipeline and put the file there."); st.stop()
 
     st.markdown(f"""
     <div class="hero">
